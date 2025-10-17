@@ -1,0 +1,87 @@
+{
+  "expo": {
+    "name": "MediWear",
+    "slug": "mediwear",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/logos.png",
+    "userInterfaceStyle": "light",
+    "newArchEnabled": true,
+    "splash": {
+      "image": "./assets/logos.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#ffffff"
+    },
+    "ios": {
+      "supportsTablet": true,
+      "infoPlist": {
+        "UIBackgroundModes": [
+          "background-processing",
+          "background-fetch",
+          "bluetooth-central",
+          "remote-notification"
+        ],
+        "NSBluetoothAlwaysUsageDescription": "MediWear needs Bluetooth to connect to your medication dispenser device.",
+        "NSBluetoothPeripheralUsageDescription": "MediWear needs Bluetooth to communicate with your medication dispenser.",
+        "NSLocationWhenInUseUsageDescription": "MediWear needs location permission to scan for Bluetooth devices."
+      },
+      "bundleIdentifier": "com.yourname.mediwear"
+    },
+    "android": {
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/logos.png",
+        "backgroundColor": "#ffffff"
+      },
+      "permissions": [
+        "android.permission.RECEIVE_BOOT_COMPLETED",
+        "android.permission.WAKE_LOCK",
+        "android.permission.VIBRATE",
+        "android.permission.SCHEDULE_EXACT_ALARM",
+        "android.permission.POST_NOTIFICATIONS",
+        "android.permission.BLUETOOTH",
+        "android.permission.BLUETOOTH_ADMIN",
+        "android.permission.BLUETOOTH_CONNECT",
+        "android.permission.BLUETOOTH_SCAN",
+        "android.permission.ACCESS_FINE_LOCATION",
+        "android.permission.ACCESS_COARSE_LOCATION"
+      ],
+      "package": "com.yourname.mediwear"
+    },
+    "plugins": [
+      [
+        "expo-notifications",
+        {
+          "icon": "./assets/notification-icon.png",
+          "color": "#9D4EDD",
+          "defaultChannel": "medication-reminders",
+          "sounds": []
+        }
+      ],
+      [
+        "react-native-ble-plx",
+        {
+          "isBackgroundEnabled": true,
+          "modes": [
+            "peripheral",
+            "central"
+          ],
+          "bluetoothAlwaysPermission": "Allow MediWear to connect to your medication dispenser device"
+        }
+      ],
+      "expo-font",
+      "expo-asset"
+    ],
+    "web": {
+      "favicon": "./assets/logos.png"
+    },
+    "extra": {
+      "eas": {
+        "projectId": "806908eb-b9b9-43fc-aa94-f7f9548fb27d"
+      }
+    },
+    "owner": "lorenmay_24",
+    "expo.doctor.reactNativeDirectoryCheck.exclude": [
+      "react-native-vector-icons"
+    ]
+  }
+}
