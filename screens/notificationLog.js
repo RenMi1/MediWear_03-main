@@ -6,19 +6,20 @@ import {
   StyleSheet,
   ScrollView,
   SafeAreaView,
+  RefreshControl,
+  Alert,
 } from 'react-native';
 import { AntDesign } from '@expo/vector-icons';
-import AsyncStorage from '@react-native-async-storage/async-storage';
 import { getAuth } from 'firebase/auth';
 import { db } from '../services/firebaseConfig';
 import { collection, query, where, onSnapshot } from 'firebase/firestore';
-
-const NOTIFICATION_LOG_KEY = 'notification_log_';
+import FirestoreDataService from '../services/FirestoreDataService';
 
 export default function NotificationLog({ navigation }) {
   const [notifications, setNotifications] = useState([]);
   const [selectedCategory, setSelectedCategory] = useState('all');
   const [isLoading, setIsLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
   const auth = getAuth();
 
   useEffect(() => {
@@ -33,32 +34,41 @@ export default function NotificationLog({ navigation }) {
         return;
       }
 
-      const keys = await AsyncStorage.getAllKeys();
-      const notificationKeys = keys.filter(key => key.startsWith(NOTIFICATION_LOG_KEY));
+      // Load all notifications from Firestore
+      const allNotifications = await FirestoreDataService.getNotificationHistory(user.uid, 100);
+      
+      // Transform Firestore timestamp to JavaScript timestamp
+      const transformedNotifications = allNotifications.map(notif => ({
+        ...notif,
+        time: notif.timestamp?.toDate ? notif.timestamp.toDate().getTime() : Date.now()
+      }));
+      
+      setNotifications(transformedNotifications);
 
-      const allNotifications = [];
-      for (const key of notificationKeys) {
-        const data = await AsyncStorage.getItem(key);
-        if (data) {
-          const parsed = JSON.parse(data);
-          allNotifications.push(...parsed);
-        }
-      }
+      // Set up real-time listener for medicines to create triggered notifications
+      const medsQuery = query(
+        collection(db, 'medications'),
+        where('userId', '==', user.uid)
+      );
 
-      const medsQuery = query(collection(db, 'medications'), where('userId', '==', user.uid));
-      const unsubscribe = onSnapshot(medsQuery, async snapshot => {
+      const unsubscribe = onSnapshot(medsQuery, async (snapshot) => {
         const medicineData = snapshot.docs.map(doc => ({
           id: doc.id,
           ...doc.data(),
         }));
 
-        await checkAndCreateNotifications(medicineData);
-        const updatedNotifications = await getAllNotifications();
-        setNotifications(updatedNotifications);
+        await checkAndCreateNotifications(medicineData, user.uid);
+        
+        // Reload notifications after checking
+        const updatedNotifications = await FirestoreDataService.getNotificationHistory(user.uid, 100);
+        const transformed = updatedNotifications.map(notif => ({
+          ...notif,
+          time: notif.timestamp?.toDate ? notif.timestamp.toDate().getTime() : Date.now()
+        }));
+        setNotifications(transformed);
         setIsLoading(false);
       });
 
-      setNotifications(allNotifications.sort((a, b) => new Date(b.time) - new Date(a.time)));
       setIsLoading(false);
       return () => unsubscribe?.();
     } catch (error) {
@@ -67,24 +77,19 @@ export default function NotificationLog({ navigation }) {
     }
   };
 
-  const getAllNotifications = async () => {
-    const keys = await AsyncStorage.getAllKeys();
-    const notificationKeys = keys.filter(key => key.startsWith(NOTIFICATION_LOG_KEY));
-    const allNotifications = [];
-
-    for (const key of notificationKeys) {
-      const data = await AsyncStorage.getItem(key);
-      if (data) {
-        const parsed = JSON.parse(data);
-        allNotifications.push(...parsed);
-      }
-    }
-    return allNotifications.sort((a, b) => new Date(b.time) - new Date(a.time));
+  const onRefresh = async () => {
+    setRefreshing(true);
+    await loadNotifications();
+    setRefreshing(false);
   };
 
-  const checkAndCreateNotifications = async medicines => {
+  const checkAndCreateNotifications = async (medicines, userId) => {
     const now = new Date();
     const dateKey = now.toISOString().split('T')[0];
+
+    // Get existing notifications to avoid duplicates
+    const existingNotifications = await FirestoreDataService.getNotificationHistory(userId, 1000);
+    const existingNotifIds = new Set(existingNotifications.map(n => n.notificationId));
 
     for (const med of medicines) {
       if (!med.reminderTimes || med.reminderTimes.length === 0) continue;
@@ -100,42 +105,27 @@ export default function NotificationLog({ navigation }) {
         const reminderDate = new Date();
         reminderDate.setHours(hours, minutes, 0, 0);
 
-        const notificationId = `${med.id}_${dateKey}_${reminderTime}`;
-        const existingNotifications = await getAllNotifications();
-        const alreadyLogged = existingNotifications.some(n => n.notificationId === notificationId);
-
-        if (!alreadyLogged && now >= reminderDate) {
-          await logNotification({
-            notificationId,
-            medicineId: med.id,
-            medicineName: med.name,
-            dosage: med.dosage,
-            time: reminderDate.toISOString(),
-            scheduledTime: reminderTime,
-            action: 'triggered',
-            type: 'reminder',
-          });
+        // Check if we should log this as triggered
+        if (now >= reminderDate) {
+          const notificationId = `${med.id}_${dateKey}_${reminderTime}`;
+          
+          if (!existingNotifIds.has(notificationId)) {
+            await FirestoreDataService.logNotification(
+              userId,
+              med.id,
+              med.name,
+              med.dosage,
+              'triggered',
+              reminderTime
+            );
+            console.log(`Auto-logged triggered notification for ${med.name} at ${reminderTime}`);
+          }
         }
       }
     }
   };
 
-  const logNotification = async notification => {
-    try {
-      const dateKey = new Date(notification.time).toISOString().split('T')[0];
-      const storageKey = `${NOTIFICATION_LOG_KEY}${dateKey}`;
-      const existing = await AsyncStorage.getItem(storageKey);
-      const notifications = existing ? JSON.parse(existing) : [];
-      notifications.push(notification);
-      await AsyncStorage.setItem(storageKey, JSON.stringify(notifications));
-      const updated = await getAllNotifications();
-      setNotifications(updated);
-    } catch (error) {
-      console.error('Error logging notification:', error);
-    }
-  };
-
-  const formatTime = timestamp => {
+  const formatTime = (timestamp) => {
     const date = new Date(timestamp);
     const now = new Date();
     const diffInMinutes = Math.floor((now - date) / (1000 * 60));
@@ -153,7 +143,7 @@ export default function NotificationLog({ navigation }) {
     return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
   };
 
-  const getFullTimestamp = timestamp => {
+  const getFullTimestamp = (timestamp) => {
     const date = new Date(timestamp);
     return date.toLocaleString('en-US', {
       month: 'short',
@@ -165,7 +155,7 @@ export default function NotificationLog({ navigation }) {
     });
   };
 
-  const categorizeNotifications = notifications => {
+  const categorizeNotifications = (notifications) => {
     const now = new Date();
     const categories = {
       latest: [],
@@ -179,7 +169,7 @@ export default function NotificationLog({ navigation }) {
       const notifDate = new Date(notification.time);
       const hoursDiff = (now - notifDate) / (1000 * 60 * 60);
 
-      if (notification.action === 'acknowledged' || notification.action === 'taken') {
+      if (notification.action === 'taken') {
         categories.taken.push(notification);
       } else if (notification.action === 'missed') {
         categories.missed.push(notification);
@@ -197,9 +187,8 @@ export default function NotificationLog({ navigation }) {
     return categories;
   };
 
-  const getStatusIcon = action => {
+  const getStatusIcon = (action) => {
     switch (action) {
-      case 'acknowledged':
       case 'taken':
         return { name: 'checkcircle', color: '#10B981' };
       case 'dismissed':
@@ -213,9 +202,8 @@ export default function NotificationLog({ navigation }) {
     }
   };
 
-  const getStatusText = action => {
+  const getStatusText = (action) => {
     switch (action) {
-      case 'acknowledged':
       case 'taken':
         return 'Taken';
       case 'dismissed':
@@ -227,6 +215,32 @@ export default function NotificationLog({ navigation }) {
       default:
         return 'Pending';
     }
+  };
+
+  const handleClearOldNotifications = async () => {
+    const user = auth.currentUser;
+    if (!user) return;
+
+    Alert.alert(
+      'Clear Old Notifications',
+      'Clear notifications older than 30 days?',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Clear',
+          style: 'destructive',
+          onPress: async () => {
+            const cleared = await FirestoreDataService.clearOldNotifications(user.uid, 30);
+            if (cleared > 0) {
+              Alert.alert('Success', `Cleared ${cleared} old notifications`);
+              await loadNotifications();
+            } else {
+              Alert.alert('Info', 'No old notifications to clear');
+            }
+          }
+        }
+      ]
+    );
   };
 
   const categorizedNotifications = categorizeNotifications(notifications);
@@ -254,7 +268,12 @@ export default function NotificationLog({ navigation }) {
           <AntDesign name="arrowleft" size={22} color="#1F2937" />
         </TouchableOpacity>
         <Text style={styles.headerTitle}>Notifications</Text>
-        <View style={styles.headerSpacer} />
+        <TouchableOpacity 
+          style={styles.clearButton} 
+          onPress={handleClearOldNotifications}
+        >
+          <AntDesign name="delete" size={20} color="#EF4444" />
+        </TouchableOpacity>
       </View>
 
       <ScrollView
@@ -269,10 +288,7 @@ export default function NotificationLog({ navigation }) {
           { key: 'missed', label: `Missed (${missedCount})` },
           { key: 'taken', label: `Taken (${takenCount})` },
           { key: 'read', label: `Other (${readCount})` },
-
-
         ].map(tab => (
-
           <TouchableOpacity
             key={tab.key}
             style={[
@@ -297,6 +313,9 @@ export default function NotificationLog({ navigation }) {
         style={styles.scrollView}
         showsVerticalScrollIndicator={false}
         contentContainerStyle={styles.scrollContent}
+        refreshControl={
+          <RefreshControl refreshing={refreshing} onRefresh={onRefresh} />
+        }
       >
         {isLoading ? (
           <View style={styles.emptyContainer}>
@@ -308,7 +327,7 @@ export default function NotificationLog({ navigation }) {
             const statusIcon = getStatusIcon(notification.action);
             const statusText = getStatusText(notification.action);
             return (
-              <View key={index} style={styles.notificationCard}>
+              <View key={notification.id || index} style={styles.notificationCard}>
                 <View style={styles.cardLeft}>
                   <View style={styles.iconCircle}>
                     <Text style={styles.medicineIcon}>💊</Text>
@@ -317,7 +336,14 @@ export default function NotificationLog({ navigation }) {
                 <View style={styles.cardCenter}>
                   <Text style={styles.medicineName}>{notification.medicineName}</Text>
                   <Text style={styles.dosageText}>{notification.dosage}</Text>
-                  <Text style={styles.statusLabel}>{statusText}</Text>
+                  <View style={styles.statusRow}>
+                    <Text style={styles.statusLabel}>{statusText}</Text>
+                    {notification.scheduledTime && notification.scheduledTime !== 'N/A' && (
+                      <Text style={styles.scheduledTime}>
+                        • Scheduled: {notification.scheduledTime}
+                      </Text>
+                    )}
+                  </View>
                   <Text style={styles.timestampText}>
                     {getFullTimestamp(notification.time)}
                   </Text>
@@ -338,6 +364,11 @@ export default function NotificationLog({ navigation }) {
           <View style={styles.emptyContainer}>
             <AntDesign name="inbox" size={56} color="#E5E7EB" />
             <Text style={styles.emptyTitle}>No notifications</Text>
+            <Text style={styles.emptySubtitle}>
+              {selectedCategory === 'all'
+                ? 'Your notification history will appear here'
+                : `No ${selectedCategory} notifications yet`}
+            </Text>
           </View>
         )}
       </ScrollView>
@@ -372,8 +403,11 @@ const styles = StyleSheet.create({
     color: '#1F2937',
     letterSpacing: -0.3,
   },
-  headerSpacer: {
+  clearButton: {
     width: 36,
+    height: 36,
+    justifyContent: 'center',
+    alignItems: 'center',
   },
   categoryContainer: {
     backgroundColor: '#FFFFFF',
@@ -443,14 +477,25 @@ const styles = StyleSheet.create({
     fontSize: 13,
     color: '#6B7280',
   },
+  statusRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginTop: 4,
+    flexWrap: 'wrap',
+  },
   statusLabel: {
     fontSize: 12,
     color: '#3B82F6',
-    marginTop: 4,
+  },
+  scheduledTime: {
+    fontSize: 11,
+    color: '#9CA3AF',
+    marginLeft: 4,
   },
   timestampText: {
     fontSize: 11,
     color: '#9CA3AF',
+    marginTop: 2,
   },
   cardRight: {
     alignItems: 'flex-end',
@@ -474,5 +519,12 @@ const styles = StyleSheet.create({
     fontWeight: '600',
     color: '#1F2937',
     marginTop: 12,
+  },
+  emptySubtitle: {
+    fontSize: 14,
+    color: '#6B7280',
+    marginTop: 4,
+    textAlign: 'center',
+    paddingHorizontal: 40,
   },
 });
