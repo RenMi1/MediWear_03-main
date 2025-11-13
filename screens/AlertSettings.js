@@ -1,3 +1,4 @@
+// screens/AlertSettings.js - Updated to use Firestore
 import React, { useState, useCallback } from 'react';
 import {
   View,
@@ -17,7 +18,7 @@ import { collection, doc, setDoc, updateDoc, serverTimestamp } from 'firebase/fi
 import * as Haptics from 'expo-haptics';
 import CustomNotificationModal from '../components/CustomNotificationModal';
 import NotificationService from '../services/NotificationService';
-import NotificationLogger from '../utils/NotificationLogger';
+import FirestoreDataService from '../services/FirestoreDataService';
 
 import phoneIcon from '../assets/iphone.png';
 import watchIcon from '../assets/watch.png';
@@ -41,103 +42,114 @@ export default function AlertSettings({ navigation, route }) {
     await Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Heavy);
   };
 
-const scheduleAlarmAlerts = useCallback(async (medicationData) => {
-  if (!medicationData.reminderEnabled || !medicationData.reminderTimes?.length) return;
+  const scheduleAlarmAlerts = useCallback(async (medicationData) => {
+    if (!medicationData.reminderEnabled || !medicationData.reminderTimes?.length) return;
+    if (!user) return;
 
-  for (let i = 0; i < medicationData.reminderTimes.length; i++) {
-    const timeString = medicationData.reminderTimes[i];
-    const dateString = medicationData.reminderDates?.[i] || medicationData.startDate;
-    try {
-      const date = new Date(dateString);
-      const [time, meridiem] = timeString.split(' ');
-      const [hours, minutes] = time.split(':').map(Number);
-      const hour24 =
-        meridiem === 'PM' && hours !== 12 ? hours + 12 :
-        meridiem === 'AM' && hours === 12 ? 0 : hours;
+    for (let i = 0; i < medicationData.reminderTimes.length; i++) {
+      const timeString = medicationData.reminderTimes[i];
+      const dateString = medicationData.reminderDates?.[i] || medicationData.startDate;
+      try {
+        const date = new Date(dateString);
+        const [time, meridiem] = timeString.split(' ');
+        const [hours, minutes] = time.split(':').map(Number);
+        const hour24 =
+          meridiem === 'PM' && hours !== 12 ? hours + 12 :
+          meridiem === 'AM' && hours === 12 ? 0 : hours;
 
-      date.setHours(hour24, minutes, 0, 0);
+        date.setHours(hour24, minutes, 0, 0);
 
-      const alertTime = new Date(date);
-      if (medicationData.alertSettings?.earlyReminder) alertTime.setMinutes(alertTime.getMinutes() - 5);
+        const alertTime = new Date(date);
+        if (medicationData.alertSettings?.earlyReminder) alertTime.setMinutes(alertTime.getMinutes() - 5);
 
-      const timeUntil = alertTime - new Date();
-      if (timeUntil > 0) {
-        setTimeout(async () => {
-          await triggerAlertHaptics();
-          await NotificationService.sendMedicationNotification(medicationData);
-          
-          // NEW: Log notification as triggered
-          await NotificationLogger.logTriggered(
-            medicationData.id,
-            medicationData.name,
-            medicationData.dosage,
-            timeString
-          );
-          
-          setCurrentMedicationAlert({
-            title: medicationData.alertSettings?.earlyReminder
-              ? `⏰ Upcoming: ${medicationData.name}`
-              : `Time to take ${medicationData.name}`,
-            message: `${medicationData.dosage} - ${timeString}${medicationData.takeWithFood ? '\n🍽️ Take with food' : ''}`,
-            ...medicationData
-          });
-          setShowNotificationModal(true);
-        }, timeUntil);
+        const timeUntil = alertTime - new Date();
+        if (timeUntil > 0) {
+          setTimeout(async () => {
+            await triggerAlertHaptics();
+            await NotificationService.sendMedicationNotification(medicationData);
+            
+            // Log notification as triggered to Firestore
+            await FirestoreDataService.logNotification(
+              user.uid,
+              medicationData.id,
+              medicationData.name,
+              medicationData.dosage,
+              'triggered',
+              timeString
+            );
+            
+            setCurrentMedicationAlert({
+              title: medicationData.alertSettings?.earlyReminder
+                ? `⏰ Upcoming: ${medicationData.name}`
+                : `Time to take ${medicationData.name}`,
+              message: `${medicationData.dosage} - ${timeString}${medicationData.takeWithFood ? '\n🍽️ Take with food' : ''}`,
+              ...medicationData
+            });
+            setShowNotificationModal(true);
+          }, timeUntil);
+        }
+      } catch (err) {
+        console.error('Error scheduling alarm:', err);
       }
-    } catch (err) {
-      console.error('Error scheduling alarm:', err);
     }
-  }
-}, []);
+  }, [user]);
 
+  const handleDismissNotification = async (medicationData) => {
+    setShowNotificationModal(false);
+    
+    if (medicationData && user) {
+      // Log the notification as dismissed to Firestore
+      const scheduledTime = medicationData.reminderTimes?.[0] || null;
+      await FirestoreDataService.logNotification(
+        user.uid,
+        medicationData.id,
+        medicationData.name,
+        medicationData.dosage,
+        'dismissed',
+        scheduledTime
+      );
+    }
+  };
 
-const handleDismissNotification = async (medicationData) => {
-  setShowNotificationModal(false);
-  
-  if (medicationData) {
-    // Log the notification as dismissed
-    const scheduledTime = medicationData.reminderTimes?.[0] || null;
-    await NotificationLogger.logDismissed(
-      medicationData.id,
-      medicationData.name,
-      medicationData.dosage,
-      scheduledTime
-    );
-  }
-};
+  const handleWait10Minutes = async (medicationData) => {
+    setShowNotificationModal(false);
+    
+    if (user) {
+      // Log as dismissed (waiting)
+      const scheduledTime = medicationData.reminderTimes?.[0] || null;
+      await FirestoreDataService.logNotification(
+        user.uid,
+        medicationData.id,
+        medicationData.name,
+        medicationData.dosage,
+        'dismissed',
+        scheduledTime
+      );
+    }
 
-      const handleWait10Minutes = async (medicationData) => {
-        setShowNotificationModal(false);
-        
-        // Log as dismissed (waiting)
-        const scheduledTime = medicationData.reminderTimes?.[0] || null;
-        await NotificationLogger.logDismissed(
+    setTimeout(async () => {
+      await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+      await NotificationService.sendMedicationNotification({
+        ...medicationData,
+        name: `Reminder: ${medicationData.name}`
+      });
+      
+      if (user) {
+        // Log the follow-up notification as triggered
+        await FirestoreDataService.logNotification(
+          user.uid,
           medicationData.id,
-          medicationData.name,
+          `Reminder: ${medicationData.name}`,
           medicationData.dosage,
+          'triggered',
           scheduledTime
         );
-
-         setTimeout(async () => {
-    await Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-    await NotificationService.sendMedicationNotification({
-      ...medicationData,
-      name: `Reminder: ${medicationData.name}`
-    });
-    
-    // Log the follow-up notification as triggered
-    await NotificationLogger.logTriggered(
-      medicationData.id,
-      `Reminder: ${medicationData.name}`,
-      medicationData.dosage,
-      scheduledTime
-    );
-    
-    setCurrentMedicationAlert(medicationData);
-    setShowNotificationModal(true);
-  }, 10 * 60 * 1000);
-};
-
+      }
+      
+      setCurrentMedicationAlert(medicationData);
+      setShowNotificationModal(true);
+    }, 10 * 60 * 1000);
+  };
 
   const saveToFirestore = async (data) => {
     if (!user) throw new Error('User not logged in');
@@ -520,15 +532,6 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     flex: 1,
   },
-  optionIconContainer: {
-    width: 50,
-    height: 50,
-    borderRadius: 25,
-    backgroundColor: '#F8F9FA',
-    alignItems: 'center',
-    justifyContent: 'center',
-    marginRight: 12,
-  },
   optionIcon: {
     fontSize: 24,
   },
@@ -585,15 +588,6 @@ const styles = StyleSheet.create({
   toggleOptionCardActive: {
     borderColor: '#9D4EDD',
     backgroundColor: '#F9F5FF',
-  },
-  toggleIconContainer: {
-    width: 46,
-    height: 46,
-    borderRadius: 23,
-    backgroundColor: '#F8F9FA',
-    alignItems: 'center',
-    justifyContent: 'center',
-    marginRight: 12,
   },
   bottomSpacing: {
     height: 20,
