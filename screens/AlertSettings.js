@@ -1,4 +1,3 @@
-// screens/AlertSettings.js - Updated to use Firestore
 import React, { useState, useCallback } from 'react';
 import {
   View,
