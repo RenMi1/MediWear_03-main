@@ -1,3 +1,4 @@
+// screens/MedicineList.js - Updated to use Firestore
 import React, { useState, useEffect } from "react";
 import {
     View,
@@ -10,11 +11,11 @@ import {
     Platform,
     Image,
 } from "react-native";
-import AsyncStorage from '@react-native-async-storage/async-storage';
 import { MaterialIcons, Ionicons } from "@expo/vector-icons";
 import LoggingService from '../services/LoggingService';
-import NotificationLogger from '../utils/NotificationLogger';
-
+import FirestoreDataService from '../services/FirestoreDataService';
+import { useFocusEffect } from '@react-navigation/native';
+import BluetoothService from '../services/BluetoothService';
 
 import { getAuth, onAuthStateChanged } from "firebase/auth";
 import { db } from '../services/firebaseConfig';
@@ -36,9 +37,8 @@ export default function MedicineList({ navigation }) {
     const [currentDate, setCurrentDate] = useState('');
     const [isLoading, setIsLoading] = useState(true);
     const [user, setUser] = useState(null);
+    const [syncingMedicines, setSyncingMedicines] = useState({});
 
-    const STATUS_STORAGE_KEY = 'medicine_status_';
-    const DAILY_STATUS_KEY = 'daily_status_';
     const auth = getAuth();
 
     const getCurrentDateKey = () => {
@@ -57,7 +57,6 @@ export default function MedicineList({ navigation }) {
         return today.toLocaleDateString('en-US', options);
     };
 
-    // Check if medication should be active today based on start/end dates
     const isMedicationActiveToday = (medicine) => {
         const today = new Date();
         today.setHours(0, 0, 0, 0); 
@@ -83,56 +82,40 @@ export default function MedicineList({ navigation }) {
         return true;
     };
 
-    const cleanupOldAnalyticsData = async () => {
+    const cleanupOldData = async () => {
         try {
-            const allKeys = await AsyncStorage.getAllKeys();
-            const today = new Date();
-            const oneDayAgo = new Date(today.getTime() - 24 * 60 * 60 * 1000);
-            const oneDayAgoKey = oneDayAgo.toISOString().split('T')[0];
-
-            const dailyStatusKeysToRemove = allKeys.filter(key => {
-                if (!key.startsWith(DAILY_STATUS_KEY)) return false;
-                const dateFromKey = key.replace(DAILY_STATUS_KEY, '');
-                return dateFromKey < oneDayAgoKey;
-            });
-
-            const statusKeysToRemove = allKeys.filter(key => {
-                if (!key.startsWith(STATUS_STORAGE_KEY)) return false;
-                const parts = key.split('_');
-                const dateFromKey = parts[parts.length - 1];
-                return dateFromKey < oneDayAgoKey;
-            });
-
-            const keysToRemove = [...dailyStatusKeysToRemove, ...statusKeysToRemove];
-
-            if (keysToRemove.length > 0) {
-                await AsyncStorage.multiRemove(keysToRemove);
-                console.log(`Cleaned up ${keysToRemove.length} old analytics entries`);
-            }
+            if (!user || !user.uid) return;
+            
+            // Clean up old daily progress and notifications
+            await FirestoreDataService.cleanupOldDailyProgress(user.uid);
+            await FirestoreDataService.clearOldNotifications(user.uid, 30);
+            
+            console.log('Cleaned up old data');
         } catch (error) {
-            console.error('Failed to cleanup old analytics data:', error);
+            console.error('Failed to cleanup old data:', error);
         }
     };
     
-    const loadMedicineStatuses = async (meds, dateKey) => {
-        const initialStatus = {};
-        for (const med of meds) {
-            // Don't load status for medications that haven't started yet
-            if (!isMedicationActiveToday(med)) {
-                initialStatus[med.id] = 'scheduled';
-                continue;
+    const loadMedicineStatuses = async (meds) => {
+        if (!user || !user.uid) return;
+
+        try {
+            const dailyProgress = await FirestoreDataService.getDailyProgress(user.uid);
+            const initialStatus = {};
+
+            for (const med of meds) {
+                if (!isMedicationActiveToday(med)) {
+                    initialStatus[med.id] = 'scheduled';
+                    continue;
+                }
+                
+                initialStatus[med.id] = dailyProgress[med.id]?.status || 'pending';
             }
             
-            const statusKey = `${STATUS_STORAGE_KEY}${med.id}_${dateKey}`;
-            try {
-                const status = await AsyncStorage.getItem(statusKey);
-                initialStatus[med.id] = status || 'pending';
-            } catch (error) {
-                console.error(`Error loading status for medicine ${med.id}:`, error);
-                initialStatus[med.id] = 'pending';
-            }
+            setMedicineStatus(initialStatus);
+        } catch (error) {
+            console.error('Error loading statuses:', error);
         }
-        setMedicineStatus(initialStatus);
     };
 
     const loadMedicines = (userId) => {
@@ -142,7 +125,7 @@ export default function MedicineList({ navigation }) {
             return () => {};
         }
         
-        cleanupOldAnalyticsData();
+        cleanupOldData();
         
         const medsQuery = query(
             collection(db, "medications"),
@@ -151,8 +134,6 @@ export default function MedicineList({ navigation }) {
 
         const unsubscribe = onSnapshot(medsQuery, async (snapshot) => {
             try {
-                const dateKey = getCurrentDateKey();
-                
                 const fetchedMedicines = snapshot.docs.map(doc => ({
                     id: doc.id,
                     ...doc.data(),
@@ -167,7 +148,7 @@ export default function MedicineList({ navigation }) {
                 }
                 
                 setMedicines(fetchedMedicines);
-                await loadMedicineStatuses(fetchedMedicines, dateKey);
+                await loadMedicineStatuses(fetchedMedicines);
 
                 setCurrentDate(getFormattedDate());
                 setIsLoading(false);
@@ -203,8 +184,15 @@ export default function MedicineList({ navigation }) {
         return () => authUnsubscribe();
     }, []); 
 
+    useFocusEffect(
+        React.useCallback(() => {
+            if (user && user.uid && medicines.length > 0) {
+                loadMedicineStatuses(medicines);
+            }
+        }, [user, medicines])
+    );
+
     const getNextReminderTime = (medicine) => {
-        // Check if medication is active
         if (!isMedicationActiveToday(medicine)) {
             if (medicine.startDate) {
                 const startDate = new Date(medicine.startDate);
@@ -281,24 +269,23 @@ export default function MedicineList({ navigation }) {
         }
     };
 
-                useEffect(() => {
-                const checkMissedDoses = async () => {
-                    const now = new Date();
-                    const dateKey = getCurrentDateKey();
+    useEffect(() => {
+        const checkMissedDoses = async () => {
+            if (!user || !user.uid) return;
 
-                    let hasChanges = false;
-                    const newStatus = { ...medicineStatus };
+            const now = new Date();
+            let hasChanges = false;
+            const newStatus = { ...medicineStatus };
 
-                    for (const med of medicines) {
-                    // Skip medications that haven't started yet
-                    if (!isMedicationActiveToday(med)) {
-                        continue;
-                    }
+            for (const med of medicines) {
+                if (!isMedicationActiveToday(med)) {
+                    continue;
+                }
 
-                    if (!isMedicineScheduledForToday(med)) continue;
+                if (!isMedicineScheduledForToday(med)) continue;
 
-                    if (newStatus[med.id] === 'pending' && med.reminderTimes && med.reminderTimes.length > 0) {
-                        for (const reminderTime of med.reminderTimes) {
+                if (newStatus[med.id] === 'pending' && med.reminderTimes && med.reminderTimes.length > 0) {
+                    for (const reminderTime of med.reminderTimes) {
                         const [time, meridiem] = reminderTime.split(' ');
                         if (!time || !meridiem) continue;
 
@@ -320,45 +307,49 @@ export default function MedicineList({ navigation }) {
                             newStatus[med.id] = 'missed';
                             hasChanges = true;
 
-                            const statusKey = `${STATUS_STORAGE_KEY}${med.id}_${dateKey}`;
-                            await AsyncStorage.setItem(statusKey, 'missed');
+                            // Save to Firestore
+                            await FirestoreDataService.saveDailyProgress(
+                                user.uid,
+                                med.id,
+                                'missed',
+                                med.name
+                            );
 
                             const currentTimeStr = now.toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' });
                             const minutesLate = Math.floor((now - fiveMinutesAfterDose) / 60000);
                             
-                            // Log to LoggingService (existing)
                             await LoggingService.addLog(
-                            'missed',
-                            `Missed dose detected: ${med.name}`,
-                            `Scheduled: ${reminderTime}, Detected at: ${currentTimeStr} (${minutesLate} minutes late)`
+                                'missed',
+                                `Missed dose detected: ${med.name}`,
+                                `Scheduled: ${reminderTime}, Detected at: ${currentTimeStr} (${minutesLate} minutes late)`
                             );
 
-                            // NEW: Log to NotificationLogger
-                            await NotificationLogger.logMissed(
-                            med.id,
-                            med.name,
-                            med.dosage,
-                            reminderTime
+                            await FirestoreDataService.logNotification(
+                                user.uid,
+                                med.id,
+                                med.name,
+                                med.dosage,
+                                'missed',
+                                reminderTime
                             );
-
-                            await updateDailyProgress(med.id, 'missed', med.name);
+                            
                             break;
                         }
-                        }
                     }
-                    }
-
-                    if (hasChanges) {
-                    setMedicineStatus(newStatus);
-                    }
-                };
-
-                if (medicines.length > 0) {
-                    checkMissedDoses();
-                    const intervalId = setInterval(checkMissedDoses, 60000);
-                    return () => clearInterval(intervalId);
                 }
-                }, [medicines, medicineStatus]);
+            }
+
+            if (hasChanges) {
+                setMedicineStatus(newStatus);
+            }
+        };
+
+        if (medicines.length > 0) {
+            checkMissedDoses();
+            const intervalId = setInterval(checkMissedDoses, 60000);
+            return () => clearInterval(intervalId);
+        }
+    }, [medicines, medicineStatus, user]);
 
     const handleDelete = async (id) => {
         Alert.alert(
@@ -446,73 +437,136 @@ export default function MedicineList({ navigation }) {
         }
     };
 
-  const handleTaken = async (medicineId) => {
-  const dateKey = getCurrentDateKey();
-  const statusKey = `${STATUS_STORAGE_KEY}${medicineId}_${dateKey}`;
+    const handleTaken = async (medicineId) => {
+    if (!user || !user.uid) return;
 
-  try {
-    const currentStatus = medicineStatus[medicineId];
-    if (currentStatus === 'taken') {
-      Alert.alert('Info', 'This medicine is already marked as taken for today.');
-      return;
+    try {
+      // ✅ Get current status from Firestore first
+      const dailyProgress = await FirestoreDataService.getDailyProgress(user.uid);
+      const currentStatus = dailyProgress[medicineId]?.status || medicineStatus[medicineId];
+      
+      if (currentStatus === 'taken') {
+        Alert.alert('Info', 'This medicine is already marked as taken for today.');
+        return;
+      }
+
+      const medicine = medicines.find(med => med.id === medicineId);
+      const medicineName = medicine ? medicine.name : 'Unknown';
+      const medicineDosage = medicine ? medicine.dosage : 'N/A';
+      const scheduledTime = getNextReminderTime(medicine);
+
+      // ✅ Save to Firestore (primary source of truth)
+      await FirestoreDataService.saveDailyProgress(
+        user.uid,
+        medicineId,
+        'taken',
+        medicineName
+      );
+
+      await LoggingService.addLog(
+        'taken',
+        `Medicine marked as taken: ${medicineName}`,
+        `Dosage: ${medicineDosage}, Time: ${new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' })}, Status: ${currentStatus === 'missed' ? 'late (was missed)' : 'on-time'}`
+      );
+
+      await FirestoreDataService.logNotification(
+        user.uid,
+        medicineId,
+        medicineName,
+        medicineDosage,
+        'taken',
+        scheduledTime !== 'No reminders set' && scheduledTime !== 'Not yet active' ? scheduledTime : null
+      );
+
+      await decreaseInventoryQuantity(medicineId, medicineName);
+
+      // ✅ Update local state immediately
+      setMedicineStatus(prevStatus => ({
+        ...prevStatus,
+        [medicineId]: 'taken',
+      }));
+
+      console.log('Medicine marked as taken, data saved to Firestore');
+      
+      Alert.alert('Success', 'Medicine marked as taken! Inventory updated.');
+      
+      // ✅ Force reload to sync with Firestore
+      await loadMedicineStatuses(medicines);
+      
+    } catch (error) {
+      console.error('Failed to update medicine status:', error);
+      Alert.alert('Error', 'Failed to update status.');
     }
+  };
 
-    const medicine = medicines.find(med => med.id === medicineId);
-    const medicineName = medicine ? medicine.name : 'Unknown';
-    const medicineDosage = medicine ? medicine.dosage : 'N/A';
-
-    // Get the scheduled time for logging
-    const scheduledTime = getNextReminderTime(medicine);
-
-    await AsyncStorage.setItem(statusKey, 'taken');
-
-    // Log to LoggingService (existing)
-    await LoggingService.addLog(
-      'taken',
-      `Medicine marked as taken: ${medicineName}`,
-      `Dosage: ${medicineDosage}, Time: ${new Date().toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit' })}, Status: ${currentStatus === 'missed' ? 'late (was missed)' : 'on-time'}`
-    );
-
-    // NEW: Log to NotificationLogger
-    await NotificationLogger.logTaken(
-      medicineId,
-      medicineName,
-      medicineDosage,
-      scheduledTime !== 'No reminders set' ? scheduledTime : null
-    );
-
-    await decreaseInventoryQuantity(medicineId, medicineName);
-    await updateDailyProgress(medicineId, 'taken', medicineName);
-
-    setMedicineStatus(prevStatus => ({
-      ...prevStatus,
-      [medicineId]: 'taken',
-    }));
-
-    Alert.alert('Success', 'Medicine marked as taken! Inventory updated.');
-  } catch (error) {
-    console.error('Failed to update medicine status:', error);
-    Alert.alert('Error', 'Failed to update status.');
-  }
-};
-
-    const updateDailyProgress = async (medicineId, status, medicineName = 'Unknown') => {
-        const dateKey = getCurrentDateKey();
-        const progressKey = `${DAILY_STATUS_KEY}${dateKey}`;
-
+    const handleSyncToDevice = async (medicine) => {
         try {
-            const existingProgress = await AsyncStorage.getItem(progressKey);
-            const progress = existingProgress ? JSON.parse(existingProgress) : {};
+            const connectionStatus = BluetoothService.getConnectionStatus();
+            
+            if (!connectionStatus.isConnected) {
+                Alert.alert(
+                    'No Device Connected',
+                    'Please connect to your MediWear device first.',
+                    [
+                        { text: 'Cancel', style: 'cancel' },
+                        { text: 'Connect', onPress: () => navigation.navigate('Device') }
+                    ]
+                );
+                return;
+            }
 
-            progress[medicineId] = {
-                status: status,
-                timestamp: new Date().toISOString(),
-                medicineName: medicineName
-            };
+            setSyncingMedicines(prev => ({ ...prev, [medicine.id]: true }));
 
-            await AsyncStorage.setItem(progressKey, JSON.stringify(progress));
+            await LoggingService.addLog(
+                'sync',
+                `Syncing medication to device: ${medicine.name}`,
+                `Dosage: ${medicine.dosage}, Time: ${medicine.reminderTimes?.[0] || 'N/A'}`
+            );
+
+            const response = await BluetoothService.syncMedicationToDevice(medicine);
+            
+            setSyncingMedicines(prev => ({ ...prev, [medicine.id]: false }));
+
+            if (response && response.accepted) {
+                Alert.alert(
+                    'Sync Successful ✓',
+                    `${medicine.name} has been synced to your MediWear device.`,
+                    [{ text: 'OK' }]
+                );
+                
+                await LoggingService.addLog(
+                    'sync',
+                    `Successfully synced: ${medicine.name}`,
+                    'Device accepted the medication'
+                );
+            } else {
+                Alert.alert(
+                    'Sync Declined',
+                    'The device user declined the medication sync.',
+                    [{ text: 'OK' }]
+                );
+                
+                await LoggingService.addLog(
+                    'sync',
+                    `Sync declined for: ${medicine.name}`,
+                    'Device user rejected the medication'
+                );
+            }
         } catch (error) {
-            console.error('Failed to update daily progress:', error);
+            setSyncingMedicines(prev => ({ ...prev, [medicine.id]: false }));
+            
+            console.error('Sync failed:', error);
+            Alert.alert(
+                'Sync Failed',
+                `Failed to sync ${medicine.name}: ${error.message}`,
+                [{ text: 'OK' }]
+            );
+            
+            await LoggingService.addLog(
+                'sync',
+                `Failed to sync: ${medicine.name}`,
+                `Error: ${error.message}`
+            );
         }
     };
 
@@ -549,21 +603,6 @@ export default function MedicineList({ navigation }) {
         }
     };
 
-    const checkInventoryCapacity = () => {
-        const totalPills = medicines.reduce((sum, med) => sum + (med.currentQuantity || 0), 0);
-        
-        if (totalPills >= 7) {
-            Alert.alert(
-                'Device Capacity Limit',
-                `Your watch device has only 7 compartments total. All slots are currently in use. Please reduce inventory before adding new medications.`,
-                [{ text: 'OK' }]
-            );
-            return false;
-        }
-        
-        return true;
-    };
-
     return (
         <SafeAreaView style={styles.container}>
             <ScrollView
@@ -571,33 +610,32 @@ export default function MedicineList({ navigation }) {
                 showsVerticalScrollIndicator={false}
                 contentContainerStyle={styles.scrollContent}
             >
-<View style={styles.header}>
-  <View style={styles.headerTopRow}>
-    <Text style={styles.headerTitle}>My Medications</Text>
-    <View style={styles.buttonContainer}>
-    <TouchableOpacity
-      style={styles.inventoryButton}
-      onPress={() => navigation.navigate('Inventory')}
-    >
-      <Image
-        source={require('../assets/pill_bottle.png')}
-        style={{ width: 40, height: 40, tintColor: '#fff' }}
-        resizeMode="contain"
-    />
-    
-    </TouchableOpacity>
-    </View>
-  </View>
+                <View style={styles.header}>
+                    <View style={styles.headerTopRow}>
+                        <Text style={styles.headerTitle}>My Medications</Text>
+                        <View style={styles.buttonContainer}>
+                            <TouchableOpacity
+                                style={styles.inventoryButton}
+                                onPress={() => navigation.navigate('Inventory')}
+                            >
+                                <Image
+                                    source={require('../assets/pill_bottle.png')}
+                                    style={{ width: 40, height: 40, tintColor: '#fff' }}
+                                    resizeMode="contain"
+                                />
+                            </TouchableOpacity>
+                        </View>
+                    </View>
 
-  <Text style={styles.headerDate}>{currentDate}</Text>
+                    <Text style={styles.headerDate}>{currentDate}</Text>
 
-  <View style={styles.headerBadge}>
-    <MaterialIcons name="event-note" size={16} color="#2563EB" />
-    <Text style={styles.headerBadgeText}>
-      {medicines.length} total medicines
-    </Text>
-  </View>
-</View>
+                    <View style={styles.headerBadge}>
+                        <MaterialIcons name="event-note" size={16} color="#2563EB" />
+                        <Text style={styles.headerBadgeText}>
+                            {medicines.length} total medicines
+                        </Text>
+                    </View>
+                </View>
 
                 {isLoading ? (
                     <View style={styles.emptyState}>
@@ -638,6 +676,7 @@ export default function MedicineList({ navigation }) {
                             const currentQty = item.currentQuantity || 0;
                             const nextReminderText = getNextReminderTime(item);
                             const isLow = currentQty <= (item.refillReminder || 3);
+                            const isSyncing = syncingMedicines[item.id] || false;
 
                             return (
                                 <View key={item.id} style={styles.medicineCard}>
@@ -652,6 +691,21 @@ export default function MedicineList({ navigation }) {
                                                 {statusBadge.text}
                                             </Text>
                                         </View>
+
+                                        <TouchableOpacity
+                                            style={[
+                                                styles.syncButtonTopRight,
+                                                isSyncing && styles.syncButtonDisabled
+                                            ]}
+                                            onPress={() => handleSyncToDevice(item)}
+                                            disabled={isSyncing}
+                                        >
+                                            <Ionicons 
+                                                name={isSyncing ? "hourglass-outline" : "sync"} 
+                                                size={20} 
+                                                color="#9D4EDD" 
+                                            />
+                                        </TouchableOpacity>
                                     </View>
 
                                     <Text style={styles.medicineName}>{item.name}</Text>
@@ -659,21 +713,21 @@ export default function MedicineList({ navigation }) {
 
                                     <View style={styles.detailsGrid}>
                                         <View style={styles.detailBox}>
-                                        <Image
-                                        source={require('../assets/clock.png')}
-                                        style={{ width: 25, height: 25, tintColor: '#9D4EDD' }}
-                                        resizeMode="contain"
-                                    />
+                                            <Image
+                                                source={require('../assets/clock.png')}
+                                                style={{ width: 25, height: 25, tintColor: '#9D4EDD' }}
+                                                resizeMode="contain"
+                                            />
                                             <Text style={styles.detailLabel}>Next Dose</Text>
                                             <Text style={styles.detailValue}>{nextReminderText}</Text>
                                         </View>
 
                                         <View style={styles.detailBox}>
-                                        <Image
-                                        source={require('../assets/pill_bottle.png')}
-                                        style={{ width: 30, height: 30, tintColor: '#9D4EDD' }}
-                                        resizeMode="contain"
-                                    />
+                                            <Image
+                                                source={require('../assets/pill_bottle.png')}
+                                                style={{ width: 30, height: 30, tintColor: '#9D4EDD' }}
+                                                resizeMode="contain"
+                                            />
                                             <Text style={styles.detailLabel}>Inventory</Text>
                                             <Text style={[styles.detailValue, isLow && { color: '#EF4444' }]}>
                                                 {currentQty} pill{currentQty !== 1 ? 's' : ''}
@@ -728,19 +782,19 @@ export default function MedicineList({ navigation }) {
                 <TouchableOpacity
                     style={styles.fab}
                     onPress={() => navigation.navigate("AddMedicine")}
-                    >
-                <Image
-        source={require('../assets/plus-sign.png')}
-        style={{ width: 28, height: 28, tintColor: '#fff' }}
-        resizeMode="contain"
-    />
+                >
+                    <Image
+                        source={require('../assets/plus-sign.png')}
+                        style={{ width: 28, height: 28, tintColor: '#fff' }}
+                        resizeMode="contain"
+                    />
                 </TouchableOpacity>
             )}
         </SafeAreaView>
     );
 }
 
-
+// Keep all the existing styles...
 const styles = StyleSheet.create({
   container: {
     flex: 1,
@@ -783,45 +837,34 @@ const styles = StyleSheet.create({
     fontWeight: "600",
     color: "#2563EB",
   },
-
-headerTopRow: {
-  flexDirection: 'row',
-  justifyContent: 'space-between', 
-  alignItems: 'center',
-  marginBottom: 8,
-  paddingHorizontal: 16,          
-},
-
-buttonContainer: {
-  marginLeft: 20, 
-  marginRight: 20,
-  paddingRight: 25, 
-  paddingTop: 12,
-  width: 45,
-  height: 45,
-  
-},
-
-inventoryButton: {
-  backgroundColor: '#9D4EDD',
-  width: 60,
-  height: 60,
-  borderRadius: 18,
-  justifyContent: 'center',
-  alignItems: 'center',
-  shadowColor: '#000',
-  shadowOffset: { width: 0, height: 1 },
-  shadowOpacity: 0.2,
-  shadowRadius: 1.41,
-  elevation: 2,
-},
-
-inventoryEmoji: {
-  fontSize: 20,
-  color: 'white',
-  lineHeight: 20,
-  textAlign: 'center',
-},
+  headerTopRow: {
+    flexDirection: 'row',
+    justifyContent: 'space-between', 
+    alignItems: 'center',
+    marginBottom: 8,
+    paddingHorizontal: 16,          
+  },
+  buttonContainer: {
+    marginLeft: 20, 
+    marginRight: 20,
+    paddingRight: 25, 
+    paddingTop: 12,
+    width: 45,
+    height: 45,
+  },
+  inventoryButton: {
+    backgroundColor: '#9D4EDD',
+    width: 60,
+    height: 60,
+    borderRadius: 18,
+    justifyContent: 'center',
+    alignItems: 'center',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.2,
+    shadowRadius: 1.41,
+    elevation: 2,
+  },
   listContainer: {
     padding: 16,
   },
@@ -830,10 +873,9 @@ inventoryEmoji: {
     borderRadius: 16,
     padding: 16,
     marginBottom: 16,
-
     borderWidth: 1,
     borderColor: "#E5E7EB",
-      shadowColor: '#000',
+    shadowColor: '#000',
     shadowOffset: {
       width: 0,
       height: 2,
@@ -842,22 +884,12 @@ inventoryEmoji: {
     shadowRadius: 3.84,
     elevation: 5,
   },
-  
   cardHeader: {
     flexDirection: "row",
     justifyContent: "space-between",
     alignItems: "center",
     marginBottom: 10,
   },
-  iconWrapper: {
-    width: 46,
-    height: 46,
-    borderRadius: 23,
-    backgroundColor: "#EEF2FF",
-    alignItems: "center",
-    justifyContent: "center",
-  },
-  medicineEmoji: { fontSize: 22 },
   statusChip: {
     flexDirection: "row",
     alignItems: "center",
@@ -869,6 +901,24 @@ inventoryEmoji: {
   statusChipText: {
     fontSize: 13,
     fontWeight: "600",
+  },
+  syncButtonTopRight: {
+    backgroundColor: "#F3E8FF",
+    borderWidth: 1,
+    borderColor: "#9D4EDD",
+    borderRadius: 10,
+    width: 40,
+    height: 40,
+    justifyContent: "center",
+    alignItems: "center",
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 1 },
+    shadowOpacity: 0.1,
+    shadowRadius: 2,
+    elevation: 2,
+  },
+  syncButtonDisabled: {
+    opacity: 0.6,
   },
   medicineName: {
     fontSize: 20,
@@ -884,26 +934,26 @@ inventoryEmoji: {
     flexDirection: "row",
     gap: 10,
   },
- detailBox: {
-  flex: 1,
-  backgroundColor: "#F3F4F6", 
-  borderRadius: 10,
-  paddingVertical: 10,
-  paddingHorizontal: 12,
-  alignItems: "flex-start",
-  justifyContent: "center",
-},
-detailLabel: {
-  fontSize: 12,
-  color: "#6B7280",
-  marginTop: 2,
-},
-detailValue: {
-  fontSize: 14,
-  fontWeight: "600",
-  color: "#1E293B",
-  marginTop: 2,
-},
+  detailBox: {
+    flex: 1,
+    backgroundColor: "#F3F4F6", 
+    borderRadius: 10,
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+    alignItems: "flex-start",
+    justifyContent: "center",
+  },
+  detailLabel: {
+    fontSize: 12,
+    color: "#6B7280",
+    marginTop: 2,
+  },
+  detailValue: {
+    fontSize: 14,
+    fontWeight: "600",
+    color: "#1E293B",
+    marginTop: 2,
+  },
   foodTag: {
     flexDirection: "row",
     backgroundColor: "#FFFBEB",
@@ -918,51 +968,47 @@ detailValue: {
     fontSize: 13,
     fontWeight: "500",
   },
-actionRow: {
-  flexDirection: "row",
-  alignItems: "center",
-  justifyContent: "space-between",
-  gap: 8,
-  marginTop: 10,
-},
-
-actionButton: {
-  flex: 1,
-  flexDirection: "row",
-  alignItems: "center",
-  justifyContent: "center",
-  borderRadius: 8,
-  paddingVertical: 10,
-  gap: 6,
-},
-
-actionButtonText: {
-  color: "#fff",
-  fontSize: 14,
-  fontWeight: "600",
-},
-
-detailsButton: {
-  backgroundColor: "#F3F4F6",
-  borderWidth: 1,
-  borderColor: "#E5E7EB",
-},
-detailsButtonText: {
-  color: "#2563EB",
-  fontSize: 14,
-  fontWeight: "600",
-},
-
-deleteButton: {
-  backgroundColor: "#F3F4F6",
-  borderWidth: 1,
-  borderColor: "#E5E7EB",
-},
-deleteButtonText: {
-  color: "#EF4444",
-  fontSize: 14,
-  fontWeight: "600",
-},
+  actionRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    gap: 8,
+    marginTop: 10,
+  },
+  actionButton: {
+    flex: 1,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    borderRadius: 8,
+    paddingVertical: 10,
+    gap: 6,
+  },
+  actionButtonText: {
+    color: "#fff",
+    fontSize: 14,
+    fontWeight: "600",
+  },
+  detailsButton: {
+    backgroundColor: "#F3F4F6",
+    borderWidth: 1,
+    borderColor: "#E5E7EB",
+  },
+  detailsButtonText: {
+    color: "#2563EB",
+    fontSize: 14,
+    fontWeight: "600",
+  },
+  deleteButton: {
+    backgroundColor: "#F3F4F6",
+    borderWidth: 1,
+    borderColor: "#E5E7EB",
+  },
+  deleteButtonText: {
+    color: "#EF4444",
+    fontSize: 14,
+    fontWeight: "600",
+  },
   primaryButton: {
     flex: 1,
     flexDirection: "row",
@@ -977,26 +1023,6 @@ deleteButtonText: {
     color: "#fff",
     fontSize: 14,
     fontWeight: "600",
-  },
-  secondaryButton: {
-    flexDirection: "row",
-    backgroundColor: "#EFF6FF",
-    paddingVertical: 12,
-    paddingHorizontal: 14,
-    borderRadius: 10,
-    alignItems: "center",
-    justifyContent: "center",
-    gap: 6,
-  },
-  secondaryButtonText: {
-    color: "#2563EB",
-    fontSize: 14,
-    fontWeight: "600",
-  },
-  iconButton: {
-    backgroundColor: "#FEF2F2",
-    padding: 12,
-    borderRadius: 10,
   },
   emptyState: {
     alignItems: "center",
