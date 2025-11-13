@@ -4,6 +4,8 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useFocusEffect } from '@react-navigation/native';
 import { AntDesign, Entypo, FontAwesome5 } from "@expo/vector-icons";
 import BluetoothService from '../services/BluetoothService';
+import NotificationLogger from '../utils/NotificationLogger';
+import FirestoreDataService from '../services/FirestoreDataService';
 
 
 import { db, auth } from '../services/firebaseConfig';
@@ -106,32 +108,42 @@ export default function Home({ navigation }) {
   }, [userId]);
 
 
-  const loadNotificationLog = async (uid) => {
-    if (!uid) return;
+const loadNotificationLog = async (uid) => {
+  if (!uid) {
+    setNotificationLog([]);
+    setHasNotification(false);
+    return;
+  }
 
-
-    try {
-      const NOTIFICATION_LOG_KEY = getNotificationLogKey(uid);
-      const allKeys = await AsyncStorage.getAllKeys();
-      const notificationKeys = allKeys.filter(key => key.startsWith(NOTIFICATION_LOG_KEY));
-     
-      const allNotifications = [];
-      for (const key of notificationKeys) {
-        const data = await AsyncStorage.getItem(key);
-        if (data) {
-          const parsed = JSON.parse(data);
-          allNotifications.push(...parsed);
-        }
+  try {
+    const NOTIFICATION_LOG_KEY = getNotificationLogKey(uid);
+    const allKeys = await AsyncStorage.getAllKeys();
+    const notificationKeys = allKeys.filter(key => key.startsWith(NOTIFICATION_LOG_KEY));
+    
+    const allNotifications = [];
+    for (const key of notificationKeys) {
+      const data = await AsyncStorage.getItem(key);
+      if (data) {
+        const parsed = JSON.parse(data);
+        allNotifications.push(...parsed);
       }
-
-
-      setNotificationLog(allNotifications);
-      const hasUnread = allNotifications.some(notif => !notif.read);
-      setHasNotification(hasUnread);
-    } catch (error) {
-      console.error('Failed to load notification log:', error);
     }
-  };
+
+    const sortedNotifications = allNotifications.sort((a, b) => 
+      new Date(b.time) - new Date(a.time)
+    );
+
+    setNotificationLog(sortedNotifications);
+    const hasUnread = sortedNotifications.some(notif => !notif.read);
+    setHasNotification(hasUnread);
+    
+    console.log(`Loaded ${sortedNotifications.length} notifications for user`);
+  } catch (error) {
+    console.error('Failed to load notification log:', error);
+    setNotificationLog([]);
+    setHasNotification(false);
+  }
+};
 
 
   const saveNotificationLog = async (notification, uid) => {
@@ -354,44 +366,70 @@ export default function Home({ navigation }) {
   };
 
 
-  const checkMissedDoses = async (medicines, uid) => {
+const checkMissedDoses = async (medicines, uid) => {
     if (!uid) return { updatedMedicines: medicines, hasChanges: false };
 
-
     const STATUS_STORAGE_KEY = getStatusStorageKey(uid);
+    const DAILY_STATUS_KEY = getDailyStatusKey(uid);
     const now = new Date();
     const dateKey = getCurrentDateKey();
     let hasChanges = false;
-   
+    
     const updatedMedicines = await Promise.all(
       medicines.map(async (med) => {
+        const isActiveToday = isMedicationActiveToday(med);
+        
+        if (!isActiveToday) {
+          return med;
+        }
+        
         if (med.status === 'pending' && med.reminderTimes && med.reminderTimes.length > 0) {
           for (const reminderTime of med.reminderTimes) {
             const [time, meridiem] = reminderTime.split(' ');
             if (!time || !meridiem) continue;
-           
+            
             let [hours, minutes] = time.split(':').map(Number);
-           
+            
             if (meridiem.toLowerCase() === 'pm' && hours < 12) {
               hours += 12;
             }
             if (meridiem.toLowerCase() === 'am' && hours === 12) {
               hours = 0;
             }
-           
+            
             const doseTime = new Date();
             doseTime.setHours(hours, minutes, 0, 0);
-           
+            
             const tenMinutesAfterDose = new Date(doseTime.getTime() + 10 * 60000);
-           
+            
             if (now > tenMinutesAfterDose && med.status === 'pending') {
+              // ✅ Save to AsyncStorage
               const statusKey = `${STATUS_STORAGE_KEY}${med.id}_${dateKey}`;
               await AsyncStorage.setItem(statusKey, 'missed');
+              
+              // ✅ NEW: Also save to Firestore
+              await FirestoreDataService.saveDailyProgress(
+                uid,
+                med.id,
+                'missed',
+                med.name || 'Unknown Medicine'
+              );
+              
               med.status = 'missed';
               hasChanges = true;
-             
+              
               await addNotificationToLog(med, 'missed');
-             
+              
+              // ✅ NEW: Log to Firestore notification history
+              await FirestoreDataService.logNotification(
+                uid,
+                med.id,
+                med.name,
+                med.dosage,
+                'missed',
+                reminderTime
+              );
+              
               break;
             }
           }
@@ -400,163 +438,163 @@ export default function Home({ navigation }) {
       })
     );
 
-
     return { updatedMedicines, hasChanges };
-  };
+};
 
 
-  const loadTodayMedicines = async () => {
-    if (!userId) {
-      setTodayMedicines([]);
-      setMedicineStats({ totalDoses: 0, takenDoses: 0, missedDoses: 0, completionPercentage: 0 });
-      return () => {};
-    }
-
-
-    try {
-      const STATUS_STORAGE_KEY = getStatusStorageKey(userId);
-      const DAILY_STATUS_KEY = getDailyStatusKey(userId);
-      const dateKey = getCurrentDateKey();
-     
-      const q = query(
-        collection(db, "medications"),
-        where("userId", "==", userId)
-      );
-     
-      const unsubscribe = onSnapshot(q, async (querySnapshot) => {
-        const allMedicines = querySnapshot.docs.map(doc => ({
-          id: doc.id,
-          ...doc.data(),
-        }));
-       
-        const filteredMedicines = allMedicines.filter(med =>
-          med.reminderTimes &&
-          med.reminderTimes.length > 0 &&
-          med.reminderEnabled !== false &&
-          isMedicineScheduledForToday(med)
-        );
-       
-        const medicinesWithStatus = await Promise.all(
-          filteredMedicines.map(async (med) => {
-            const statusKey = `${STATUS_STORAGE_KEY}${med.id}_${dateKey}`;
-            const status = await AsyncStorage.getItem(statusKey);
-            return {
-              ...med,
-              status: status || 'pending',
-            };
-          })
-        );
-       
-        const { updatedMedicines } = await checkMissedDoses(medicinesWithStatus, userId);
-       
-        setTodayMedicines(updatedMedicines);
-
-
-        const totalDoses = updatedMedicines.length;
-        const takenDoses = updatedMedicines.filter(med => med.status === 'taken').length;
-        const missedDoses = updatedMedicines.filter(med => med.status === 'missed').length;
-        const completionPercentage = totalDoses > 0 ? Math.round((takenDoses / totalDoses) * 100) : 0;
-       
-        setMedicineStats({
-          totalDoses: totalDoses,
-          takenDoses: takenDoses,
-          missedDoses: missedDoses,
-          completionPercentage: completionPercentage
-        });
-
-
-        if (totalDoses > 0) {
-          const progressKey = `${DAILY_STATUS_KEY}${dateKey}`;
-          const progressData = {};
-         
-          updatedMedicines.forEach(med => {
-            progressData[med.id] = {
-              status: med.status,
-              timestamp: new Date().toISOString(),
-              medicineName: med.name || 'Unknown Medicine'
-            };
-          });
-         
-          await AsyncStorage.setItem(progressKey, JSON.stringify(progressData));
+const isMedicationActiveToday = (medicine) => {
+    const today = new Date();
+    today.setHours(0, 0, 0, 0); 
+    
+    // Check if medication has started
+    if (medicine.startDate) {
+        const startDate = new Date(medicine.startDate);
+        startDate.setHours(0, 0, 0, 0);
+        
+        // If start date is in the future, medication is not active
+        if (startDate > today) {
+            return false;
         }
-      }, (error) => {
-        console.error('Failed to load today\'s medicines from Firestore:', error);
-        Alert.alert("Error", "Could not load medicine schedule. Check your internet or login status.");
-        setTodayMedicines([]);
-        setMedicineStats({ totalDoses: 0, takenDoses: 0, missedDoses: 0, completionPercentage: 0 });
-      });
-
-
-      return unsubscribe;
-    } catch (error) {
-      console.error('Failed to set up Firestore listener:', error);
-      Alert.alert("Error", "Could not load medicine schedule.");
-      setTodayMedicines([]);
-      setMedicineStats({ totalDoses: 0, takenDoses: 0, missedDoses: 0, completionPercentage: 0 });
-      return () => {};
     }
-  };
+    
+    // Check if medication has ended
+    if (medicine.endDate) {
+        const endDate = new Date(medicine.endDate);
+        endDate.setHours(0, 0, 0, 0);
+        
+        // If end date has passed, medication is not active
+        if (endDate < today) {
+            return false;
+        }
+    }
+    
+    return true;
+};
 
 
-  const handleTaken = async (medicineId) => {
-    if (!userId) return;
+const loadTodayMedicines = async () => {
+  if (!userId) {
+    setTodayMedicines([]);
+    setMedicineStats({ totalDoses: 0, takenDoses: 0, missedDoses: 0, completionPercentage: 0 });
+    return () => {};
+  }
 
-
+  try {
     const STATUS_STORAGE_KEY = getStatusStorageKey(userId);
     const DAILY_STATUS_KEY = getDailyStatusKey(userId);
     const dateKey = getCurrentDateKey();
-    const statusKey = `${STATUS_STORAGE_KEY}${medicineId}_${dateKey}`;
-   
-    try {
-      await AsyncStorage.setItem(statusKey, 'taken');
-     
-      const progressKey = `${DAILY_STATUS_KEY}${dateKey}`;
-      const existingProgress = await AsyncStorage.getItem(progressKey);
-      const progress = existingProgress ? JSON.parse(existingProgress) : {};
-     
-      const medicine = todayMedicines.find(med => med.id === medicineId);
-      progress[medicineId] = {
-        status: 'taken',
-        timestamp: new Date().toISOString(),
-        medicineName: medicine ? medicine.name : 'Unknown'
-      };
-     
-      await AsyncStorage.setItem(progressKey, JSON.stringify(progress));
-     
-      if (medicine) {
-        await addNotificationToLog(medicine, 'taken');
-      }
-     
-      setTodayMedicines(prevMeds =>
-        prevMeds.map(med =>
-          med.id === medicineId ? { ...med, status: 'taken' } : med
-        )
+    
+    // ✅ NEW: Load Firestore progress first
+    const firestoreProgress = await FirestoreDataService.getDailyProgress(userId);
+    
+    const q = query(
+      collection(db, "medications"),
+      where("userId", "==", userId)
+    );
+    
+    const unsubscribe = onSnapshot(q, async (querySnapshot) => {
+      console.log('Firestore snapshot received - updating medicines');
+      
+      const allMedicines = querySnapshot.docs.map(doc => ({
+        id: doc.id,
+        ...doc.data(),
+      }));
+      
+      const filteredMedicines = allMedicines.filter(med =>
+        med.reminderTimes &&
+        med.reminderTimes.length > 0 &&
+        med.reminderEnabled !== false &&
+        isMedicineScheduledForToday(med) &&
+        isMedicationActiveToday(med)
       );
-
-
-      const updatedMeds = todayMedicines.map(med =>
-        med.id === medicineId ? { ...med, status: 'taken' } : med
+      
+      // ✅ NEW: Prioritize Firestore data, fallback to AsyncStorage
+      const medicinesWithStatus = await Promise.all(
+        filteredMedicines.map(async (med) => {
+          // Check Firestore first
+          const firestoreStatus = firestoreProgress[med.id]?.status;
+          
+          if (firestoreStatus) {
+            // ✅ Sync Firestore status to AsyncStorage
+            const statusKey = `${STATUS_STORAGE_KEY}${med.id}_${dateKey}`;
+            await AsyncStorage.setItem(statusKey, firestoreStatus);
+            
+            return {
+              ...med,
+              status: firestoreStatus,
+            };
+          }
+          
+          // Fallback to AsyncStorage
+          const statusKey = `${STATUS_STORAGE_KEY}${med.id}_${dateKey}`;
+          const status = await AsyncStorage.getItem(statusKey);
+          
+          return {
+            ...med,
+            status: status || 'pending',
+          };
+        })
       );
-      const totalDoses = updatedMeds.length;
-      const takenDoses = updatedMeds.filter(med => med.status === 'taken').length;
-      const missedDoses = updatedMeds.filter(med => med.status === 'missed').length;
+      
+      const { updatedMedicines } = await checkMissedDoses(medicinesWithStatus, userId);
+      
+      setTodayMedicines(updatedMedicines);
+
+      const totalDoses = updatedMedicines.length;
+      const takenDoses = updatedMedicines.filter(med => med.status === 'taken').length;
+      const missedDoses = updatedMedicines.filter(med => med.status === 'missed').length;
       const completionPercentage = totalDoses > 0 ? Math.round((takenDoses / totalDoses) * 100) : 0;
-     
+      
       setMedicineStats({
-        totalDoses,
-        takenDoses,
-        missedDoses,
-        completionPercentage
+        totalDoses: totalDoses,
+        takenDoses: takenDoses,
+        missedDoses: missedDoses,
+        completionPercentage: completionPercentage
       });
-     
-      await calculateWeeklyProgress(userId);
-     
-      Alert.alert('Success', 'Medicine marked as taken!');
-    } catch (error) {
-      console.error('Failed to update medicine status:', error);
-      Alert.alert('Error', 'Failed to update status.');
-    }
-  };
+
+      console.log(`Updated stats - Taken: ${takenDoses}/${totalDoses}`);
+
+      // ✅ Save to both AsyncStorage AND ensure Firestore is updated
+      if (totalDoses > 0) {
+        const progressKey = `${DAILY_STATUS_KEY}${dateKey}`;
+        const progressData = {};
+        
+        // Save each medicine status to Firestore
+        for (const med of updatedMedicines) {
+          progressData[med.id] = {
+            status: med.status,
+            timestamp: new Date().toISOString(),
+            medicineName: med.name || 'Unknown Medicine'
+          };
+          
+          // ✅ Ensure Firestore has the latest status
+          await FirestoreDataService.saveDailyProgress(
+            userId,
+            med.id,
+            med.status,
+            med.name || 'Unknown Medicine'
+          );
+        }
+        
+        await AsyncStorage.setItem(progressKey, JSON.stringify(progressData));
+      }
+    }, (error) => {
+      console.error('Failed to load medicines:', error);
+      Alert.alert("Error", "Could not load medicine schedule.");
+      setTodayMedicines([]);
+      setMedicineStats({ totalDoses: 0, takenDoses: 0, missedDoses: 0, completionPercentage: 0 });
+    });
+
+    return unsubscribe;
+  } catch (error) {
+    console.error('Failed to set up Firestore listener:', error);
+    Alert.alert("Error", "Could not load medicine schedule.");
+    setTodayMedicines([]);
+    setMedicineStats({ totalDoses: 0, takenDoses: 0, missedDoses: 0, completionPercentage: 0 });
+    return () => {};
+  }
+};
+
 
 
   useFocusEffect(
@@ -585,20 +623,23 @@ export default function Home({ navigation }) {
   );
 
 
-  useEffect(() => {
+useEffect(() => {
     if (!userId) return;
-   
+    
     const interval = setInterval(async () => {
       if (todayMedicines.length > 0) {
-        const { updatedMedicines, hasChanges } = await checkMissedDoses(todayMedicines, userId);
+        // Filter out medicines that aren't active today before checking for missed doses
+        const activeMedicines = todayMedicines.filter(med => isMedicationActiveToday(med));
+        
+        const { updatedMedicines, hasChanges } = await checkMissedDoses(activeMedicines, userId);
         if (hasChanges) {
           setTodayMedicines(updatedMedicines);
-         
+          
           const totalDoses = updatedMedicines.length;
           const takenDoses = updatedMedicines.filter(med => med.status === 'taken').length;
           const missedDoses = updatedMedicines.filter(med => med.status === 'missed').length;
           const completionPercentage = totalDoses > 0 ? Math.round((takenDoses / totalDoses) * 100) : 0;
-         
+          
           setMedicineStats({
             totalDoses,
             takenDoses,
@@ -609,9 +650,9 @@ export default function Home({ navigation }) {
       }
     }, 60000);
 
-
     return () => clearInterval(interval);
-  }, [userId, todayMedicines]);
+}, [userId, todayMedicines]);
+
 
 
   const getCurrentDate = () => {
@@ -649,7 +690,7 @@ export default function Home({ navigation }) {
       case 'missed':
         return { text: 'Missed', color: '#fff', backgroundColor: '#d9534f' };
       default:
-        return { text: 'Take Now', color: '#fff', backgroundColor: '#007bff' };
+        return { text: 'Pending', color: '#fff', backgroundColor: '#007bff' };
     }
   };
 
@@ -875,24 +916,27 @@ export default function Home({ navigation }) {
                           Take at {formatReminderTimes(item.reminderTimes)}
                         </Text>
                       </View>
-                      <TouchableOpacity
-                        style={[styles.statusButton, { backgroundColor: statusStyle.backgroundColor }]}
-                        onPress={() => item.status === 'pending' ? handleTaken(item.id) : null}
-                        disabled={item.status !== 'pending'}
+
+
+                      <View
+                        style={[
+                          styles.statusButton, 
+                          { backgroundColor: statusStyle.backgroundColor }
+                        ]}
                       >
                         <Text style={[styles.statusButtonText, { color: statusStyle.color }]}>
                           {statusStyle.text}
                         </Text>
-                      </TouchableOpacity>
+                      </View>
                     </View>
-                   
+                  
                     {item.takeWithFood && (
                       <View style={styles.foodReminder}>
                         <Text style={styles.foodReminderIcon}>🍽️</Text>
                         <Text style={styles.foodReminderText}>Take with meal</Text>
                       </View>
                     )}
-                   
+                  
                     {item.specialInstructions && (
                       <View style={styles.instructionReminder}>
                         <Text style={styles.instructionIcon}>⚠️</Text>
@@ -902,7 +946,7 @@ export default function Home({ navigation }) {
                   </View>
                 );
               })}
-             
+            
               <View style={styles.medicationsPending}>
                 <Text style={styles.pendingText}>
                   {medicineStats.totalDoses - medicineStats.takenDoses === 0 ?
