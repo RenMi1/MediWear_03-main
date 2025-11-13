@@ -19,11 +19,13 @@ import HistoryLog from './screens/HistoryLog';
 import LogScreen from './screens/LogScreen';
 import Inventory from './screens/Pill_Inventory';
 import NotificationLog from './screens/notificationLog'
+import MedicineWatchHub from './screens/WifiDevice';
 import {CustomDrawerContent} from './components/CustomDrawerContent';
 import { auth } from './services/firebaseConfig';
 import { onAuthStateChanged } from 'firebase/auth';
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import NotificationService from './services/NotificationService';
+import FirestoreDataService from './services/FirestoreDataService';
 import SplashScreen from './screens/SplashScreen'; 
 
 const Stack = createNativeStackNavigator();
@@ -44,6 +46,8 @@ function MyTabs() {
             iconSource = require('./assets/capsule.png');
           } else if (route.name === 'Device') {
             iconSource = require('./assets/device.png');
+          } else if (route.name === 'MedicineWatchHub') {
+            iconSource = require('./assets/wifi.png');
           } else if (route.name === 'Stats') {
             iconSource = require('./assets/stats.png');
           }
@@ -85,7 +89,12 @@ function MyTabs() {
       <Tab.Screen
         name="Device"
         component={Device}
-        options={{ tabBarLabel: 'Device' }}
+        options={{ tabBarLabel: 'Bluetooth' }}
+      />
+        <Tab.Screen
+        name="MedicineWatchHub"
+        component={MedicineWatchHub}
+        options={{ tabBarLabel: 'Wifi' }}
       />
       <Tab.Screen
         name="Stats"
@@ -115,34 +124,93 @@ export default function App() {
   const [initializing, setInitializing] = useState(true);
   const [user, setUser] = useState(null);
   const [showSplash, setShowSplash] = useState(true);
+  const notificationSetup = useRef(false);
+
+  // Setup notifications ONCE when user is verified
+  const setupNotifications = async (userId) => {
+    if (notificationSetup.current) {
+      console.log('Notifications already setup, skipping...');
+      return;
+    }
+
+    // Wait a bit to ensure Firebase is fully initialized
+    await new Promise(resolve => setTimeout(resolve, 1000));
+
+    try {
+      console.log('🔔 Starting notification setup...');
+      
+      await NotificationService.registerForPushNotificationsAsync();
+      console.log('✅ Push notifications registered');
+      
+      NotificationService.setupAlarmListener();
+      console.log('✅ Alarm listener setup');
+      
+      // Extra delay before Firebase listener
+      await new Promise(resolve => setTimeout(resolve, 500));
+      
+      NotificationService.startListeningToFirebase(userId);
+      console.log('✅ Firebase listener started');
+      
+      notificationSetup.current = true;
+      console.log('✅ All notifications setup complete');
+    } catch (error) {
+      console.error('❌ Notification setup error:', error);
+      // Don't block app from loading
+    }
+  };
 
   useEffect(() => {
+    let mounted = true;
+
     const unsubscribe = onAuthStateChanged(auth, async (currentUser) => {
-      console.log('Auth state changed:', currentUser?.email, 'Verified:', currentUser?.emailVerified);
-      
-      // Only set user if they exist AND email is verified
-      if (currentUser && currentUser.emailVerified) {
-        setUser(currentUser);
+      if (!mounted) return;
+
+      try {
+        console.log('Auth state changed:', currentUser?.email, 'Verified:', currentUser?.emailVerified);
         
-        // Setup notification permissions and listener for verified users
-        await NotificationService.registerForPushNotificationsAsync();
-        NotificationService.setupAlarmListener();
-        NotificationService.startListeningToFirebase(currentUser.uid);
-      } else {
-        // User is not logged in OR email is not verified
+        if (currentUser?.emailVerified) {
+          setUser(currentUser);
+          
+          // Setup notifications in background (non-blocking)
+          setupNotifications(currentUser.uid);
+        } else {
+          setUser(null);
+          notificationSetup.current = false;
+          
+          // Sign out unverified users
+          if (currentUser && !currentUser.emailVerified) {
+            console.log('User email not verified, signing out...');
+            auth.signOut().catch(err => console.error('Sign out error:', err));
+          }
+        }
+      } catch (error) {
+        console.error('Auth state change error:', error);
         setUser(null);
-        
-        // If user exists but email is not verified, sign them out
-        if (currentUser && !currentUser.emailVerified) {
-          console.log('User email not verified, signing out...');
-          await auth.signOut();
+      } finally {
+        if (initializing && mounted) {
+          // Small delay to ensure everything is ready
+          setTimeout(() => {
+            if (mounted) {
+              setInitializing(false);
+            }
+          }, 500);
         }
       }
-      
-      if (initializing) setInitializing(false);
     });
 
-    return unsubscribe;
+    // Safety timeout
+    const timeout = setTimeout(() => {
+      if (initializing && mounted) {
+        console.log('⏱️ Auth initialization timeout, forcing completion');
+        setInitializing(false);
+      }
+    }, 5000);
+
+    return () => {
+      mounted = false;
+      clearTimeout(timeout);
+      unsubscribe();
+    };
   }, [initializing]);
 
   const handleSplashComplete = () => {
@@ -153,7 +221,6 @@ export default function App() {
     return <SplashScreen onAnimationComplete={handleSplashComplete} />;
   }
 
-  // Show loading indicator while checking auth
   if (initializing) {
     return (
       <View style={styles.loadingContainer}>
@@ -254,6 +321,13 @@ export default function App() {
             <Stack.Screen
               name="NotificationLog"
               component={NotificationLog}
+              options={{
+                headerShown: false,
+              }}
+            />
+              <Stack.Screen
+              name="MedicineWatchHub"
+              component={MedicineWatchHub}
               options={{
                 headerShown: false,
               }}
