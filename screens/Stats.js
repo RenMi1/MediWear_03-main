@@ -7,14 +7,14 @@ import {
   ScrollView,
   SafeAreaView,
 } from 'react-native';
-import AsyncStorage from '@react-native-async-storage/async-storage';
 import { useFocusEffect } from '@react-navigation/native';
-import { AntDesign, FontAwesome5, MaterialIcons } from '@expo/vector-icons';
+import { MaterialIcons } from '@expo/vector-icons';
 import { getAuth, onAuthStateChanged } from "firebase/auth";
 import { db } from '../services/firebaseConfig';
 import { collection, query, where, onSnapshot } from 'firebase/firestore';
+import FirestoreDataService from '../services/FirestoreDataService';
 
-export default function Stats  ({ route, navigation }) {
+export default function Stats({ route, navigation }) {
   const [selectedMedicines, setSelectedMedicines] = useState([]);
   const [selectedTab, setSelectedTab] = useState('Weekly');
   const [user, setUser] = useState(null);
@@ -29,10 +29,6 @@ export default function Stats  ({ route, navigation }) {
     taken: 0
   });
 
-  const getDailyStatusKey = (userId) => `daily_status_${userId}_`;
-  const getWeeklyArchiveKey = (userId) => `weekly_archive_${userId}_`;
-  const getCurrentWeekKey = (userId) => `current_week_number_${userId}`;
-  
   const auth = getAuth();
 
   // Get current date in YYYY-MM-DD format
@@ -57,54 +53,25 @@ export default function Stats  ({ route, navigation }) {
     
     try {
       const currentWeek = getWeekNumber(new Date());
-      const CURRENT_WEEK_KEY = getCurrentWeekKey(userId);
-      const DAILY_STATUS_KEY = getDailyStatusKey(userId);
-      const WEEKLY_ARCHIVE_KEY = getWeeklyArchiveKey(userId);
+      const storedWeekKey = `current_week_${userId}`;
       
-      const storedWeek = await AsyncStorage.getItem(CURRENT_WEEK_KEY);
-
-      // If it's a new week, archive the previous week's data
-      if (storedWeek && storedWeek !== currentWeek) {
-        const allKeys = await AsyncStorage.getAllKeys();
-        const dailyKeys = allKeys.filter(key => key.startsWith(DAILY_STATUS_KEY));
+      // Check if we need to archive (simplified - you can store this in Firestore user settings)
+      const today = new Date();
+      const dayOfWeek = today.getDay();
+      
+      // Archive on Sunday night / Monday morning transition
+      if (dayOfWeek === 1) { // Monday
+        const lastWeek = getWeekNumber(new Date(today.getTime() - 7 * 24 * 60 * 60 * 1000));
         
-        const weekData = {};
-        for (const key of dailyKeys) {
-          const dateStr = key.replace(DAILY_STATUS_KEY, '');
-          const date = new Date(dateStr);
-          const weekNum = getWeekNumber(date);
-          
-          // If data belongs to previous week, archive it
-          if (weekNum === storedWeek) {
-            const data = await AsyncStorage.getItem(key);
-            if (data) {
-              weekData[dateStr] = JSON.parse(data);
-            }
-          }
-        }
-
-        // Save archived week data
-        if (Object.keys(weekData).length > 0) {
-          await AsyncStorage.setItem(
-            `${WEEKLY_ARCHIVE_KEY}${storedWeek}`,
-            JSON.stringify(weekData)
-          );
-        }
-
-        // Clean up daily status for archived week
-        for (const key of dailyKeys) {
-          const dateStr = key.replace(DAILY_STATUS_KEY, '');
-          const date = new Date(dateStr);
-          const weekNum = getWeekNumber(date);
-          
-          if (weekNum === storedWeek) {
-            await AsyncStorage.removeItem(key);
-          }
+        // Get last week's data
+        const lastWeekData = await FirestoreDataService.getProgressForDateRange(userId, 7);
+        
+        // Archive it
+        if (Object.keys(lastWeekData).length > 0) {
+          await FirestoreDataService.archiveWeekData(userId, lastWeek, lastWeekData);
+          console.log(`Archived week ${lastWeek}`);
         }
       }
-
-      // Update current week
-      await AsyncStorage.setItem(CURRENT_WEEK_KEY, currentWeek);
     } catch (error) {
       console.error('Failed to archive week data:', error);
     }
@@ -177,9 +144,12 @@ export default function Stats  ({ route, navigation }) {
   useFocusEffect(
     React.useCallback(() => {
       if (user && user.uid) {
+        console.log('Stats screen focused - reloading data');
         archiveWeekData(user.uid).then(() => {
           if (selectedMedicines.length > 0) {
             calculateRealStats(selectedMedicines, user.uid);
+          } else {
+            loadMedicines(user.uid);
           }
         });
       }
@@ -209,28 +179,28 @@ export default function Stats  ({ route, navigation }) {
     }));
   };
 
-  const calculateRealStats = async (medicineList, userId) => {
+const calculateRealStats = async (medicineList, userId) => {
     if (!userId) return;
     
     try {
       const totalMeds = medicineList.length;
 
-      // Get today's stats
+      // Get today's stats - NOW FIXED
       const todayStats = await getTodayStats(medicineList, userId);
       
-      // Get weekly stats (current week only)
+      // Get weekly stats - NOW FIXED
       const weeklyStats = await getWeeklyStats(medicineList, userId);
       
-      // Calculate overall adherence rate (all archived weeks + current week)
-      const adherenceRate = await calculateOverallAdherence(userId);
+      // Calculate overall adherence rate
+      const adherenceRate = await FirestoreDataService.calculateOverallAdherence(userId);
       
       // Calculate streak
-      const streak = await calculateStreak(userId);
+      const streak = await FirestoreDataService.calculateStreak(userId);
       
-      // Generate week adherence data (current week only)
+      // Generate week adherence data - NOW FIXED
       const thisWeekAdherence = await generateRealWeekData(medicineList, userId);
       
-      // Top performing medications (current week)
+      // Top performing medications - NOW FIXED
       const topPerforming = await getTopPerformingMeds(medicineList, userId);
 
       setStats({
@@ -243,170 +213,101 @@ export default function Stats  ({ route, navigation }) {
         missed: todayStats.missed,
         taken: todayStats.taken
       });
+      
+      console.log('✅ Stats calculated:', {
+        taken: todayStats.taken,
+        total: todayStats.total,
+        percentage: Math.round((todayStats.taken / todayStats.total) * 100)
+      });
     } catch (error) {
       console.error('Failed to calculate real stats:', error);
       resetStats();
     }
   };
 
-  const calculateOverallAdherence = async (userId) => {
-    if (!userId) return 0;
-    
-    try {
-      let totalExpected = 0;
-      let totalTaken = 0;
-
-      const WEEKLY_ARCHIVE_KEY = getWeeklyArchiveKey(userId);
-      
-      // Get all archived weeks for this user
-      const allKeys = await AsyncStorage.getAllKeys();
-      const archiveKeys = allKeys.filter(key => key.startsWith(WEEKLY_ARCHIVE_KEY));
-
-      // Process archived weeks
-      for (const key of archiveKeys) {
-        const weekData = await AsyncStorage.getItem(key);
-        if (weekData) {
-          const parsed = JSON.parse(weekData);
-          Object.values(parsed).forEach(dayData => {
-            const statuses = Object.values(dayData);
-            totalExpected += statuses.length;
-            totalTaken += statuses.filter(item => item.status === 'taken').length;
-          });
-        }
-      }
-
-      // Add current week data
-      const currentWeekStats = await getWeeklyStats([], userId);
-      totalExpected += currentWeekStats.totalExpected;
-      totalTaken += currentWeekStats.totalTaken;
-
-      return totalExpected > 0 ? Math.round((totalTaken / totalExpected) * 100) : 0;
-    } catch (error) {
-      console.error('Failed to calculate overall adherence:', error);
-      return 0;
-    }
-  };
-
-  const getTodayStats = async (medicineList, userId) => {
+const getTodayStats = async (medicineList, userId) => {
     if (!userId) return { taken: 0, missed: 0, total: medicineList.length };
     
-    const dateKey = getCurrentDateKey();
-    const DAILY_STATUS_KEY = getDailyStatusKey(userId);
-    const progressKey = `${DAILY_STATUS_KEY}${dateKey}`;
-    
     try {
-      const progressData = await AsyncStorage.getItem(progressKey);
-      if (progressData) {
-        const progress = JSON.parse(progressData);
-        const statuses = Object.values(progress);
-        
-        return {
-          taken: statuses.filter(item => item.status === 'taken').length,
-          missed: statuses.filter(item => item.status === 'missed').length,
-          total: statuses.length
-        };
-      }
+      const dailyProgress = await FirestoreDataService.getDailyProgress(userId);
+      
+      let taken = 0;
+      let missed = 0;
+      
+      // Count taken and missed from dailyProgress
+      Object.values(dailyProgress).forEach(medProgress => {
+        if (medProgress.status === 'taken') taken++;
+        if (medProgress.status === 'missed') missed++;
+      });
+      
+      // ✅ FIXED: Total should be ALL active medicines, not just those with status
+      const total = medicineList.length;
+      
+      return {
+        taken,
+        missed,
+        total  // ✅ Now correctly shows total active medicines
+      };
     } catch (error) {
       console.error('Failed to get today stats:', error);
+      return { taken: 0, missed: 0, total: medicineList.length };
     }
-    
-    return { taken: 0, missed: 0, total: medicineList.length };
   };
 
-  const getWeeklyStats = async (medicineList, userId) => {
+
+const getWeeklyStats = async (medicineList, userId) => {
     if (!userId) return { totalExpected: 0, totalTaken: 0, weeklyPercentage: 0 };
     
-    const today = new Date();
-    const currentWeek = getWeekNumber(today);
-    const DAILY_STATUS_KEY = getDailyStatusKey(userId);
-    let totalExpected = 0;
-    let totalTaken = 0;
-
-    for (let i = 0; i < 7; i++) {
-      const checkDate = new Date(today.getTime() - i * 24 * 60 * 60 * 1000);
-      const dateKey = checkDate.toISOString().split('T')[0];
-      const weekNum = getWeekNumber(checkDate);
-      
-      // Only count data from current week
-      if (weekNum === currentWeek) {
-        const progressKey = `${DAILY_STATUS_KEY}${dateKey}`;
-        
-        try {
-          const progressData = await AsyncStorage.getItem(progressKey);
-          if (progressData) {
-            const progress = JSON.parse(progressData);
-            const statuses = Object.values(progress);
-            
-            totalExpected += statuses.length;
-            totalTaken += statuses.filter(item => item.status === 'taken').length;
-          }
-        } catch (error) {
-          console.error('Failed to get daily stats for', dateKey, error);
-        }
-      }
-    }
-
-    const weeklyPercentage = totalExpected > 0 ? Math.round((totalTaken / totalExpected) * 100) : 0;
-    
-    return { totalExpected, totalTaken, weeklyPercentage };
-  };
-
-  const calculateStreak = async (userId) => {
-    if (!userId) return 0;
-    
     try {
-      const DAILY_STATUS_KEY = getDailyStatusKey(userId);
-      const allKeys = await AsyncStorage.getAllKeys();
-      const dailyStatusKeys = allKeys.filter(key => key.startsWith(DAILY_STATUS_KEY));
+      const progressData = await FirestoreDataService.getProgressForDateRange(userId, 7);
       
-      if (dailyStatusKeys.length === 0) return 0;
+      // ✅ Calculate expected doses based on medicine list and days
+      const activeMedicines = medicineList.filter(med => 
+        med.reminderTimes && 
+        med.reminderTimes.length > 0 &&
+        med.reminderEnabled !== false
+      );
+      
+      let totalTaken = 0;
+      let daysWithData = 0;
 
-      const sortedDates = dailyStatusKeys
-        .map(key => key.replace(DAILY_STATUS_KEY, ''))
-        .sort((a, b) => new Date(b) - new Date(a));
-
-      let currentStreak = 0;
-      const today = getCurrentDateKey();
-
-      for (const date of sortedDates) {
-        const progressKey = `${DAILY_STATUS_KEY}${date}`;
-        const progressData = await AsyncStorage.getItem(progressKey);
-        
-        if (progressData) {
-          const progress = JSON.parse(progressData);
-          const statuses = Object.values(progress);
-          const takenCount = statuses.filter(item => item.status === 'taken').length;
-          const totalCount = statuses.length;
-          
-          const completionRate = totalCount > 0 ? (takenCount / totalCount) : 0;
-          
-          if (completionRate >= 0.8) {
-            currentStreak++;
-          } else {
-            break;
-          }
-        } else if (date === today) {
-          continue;
-        } else {
-          break;
+      Object.values(progressData).forEach(dayData => {
+        if (Object.keys(dayData).length > 0) {
+          daysWithData++;
+          Object.values(dayData).forEach(medProgress => {
+            if (medProgress.status === 'taken') {
+              totalTaken++;
+            }
+          });
         }
-      }
+      });
 
-      return currentStreak;
+      // ✅ FIXED: Total expected = medicines × days with data
+      // (Only count days where medicines were actually scheduled)
+      const totalExpected = daysWithData > 0 ? activeMedicines.length * daysWithData : 0;
+      const weeklyPercentage = totalExpected > 0 ? Math.round((totalTaken / totalExpected) * 100) : 0;
+      
+      return { totalExpected, totalTaken, weeklyPercentage };
     } catch (error) {
-      console.error('Failed to calculate streak:', error);
-      return 0;
+      console.error('Failed to get weekly stats:', error);
+      return { totalExpected: 0, totalTaken: 0, weeklyPercentage: 0 };
     }
   };
 
-  const generateRealWeekData = async (medicineList, userId) => {
+const generateRealWeekData = async (medicineList, userId) => {
     if (!userId) return generateEmptyWeekData();
     
     const days = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
     const today = new Date();
     const currentWeek = getWeekNumber(today);
-    const DAILY_STATUS_KEY = getDailyStatusKey(userId);
     const weekData = [];
+
+    // ✅ Get count of active medicines
+    const activeMedicinesCount = medicineList.filter(med => 
+      med.reminderTimes && 
+      med.reminderTimes.length > 0 &&
+      med.reminderEnabled !== false
+    ).length;
 
     for (let i = 6; i >= 0; i--) {
       const checkDate = new Date(today.getTime() - i * 24 * 60 * 60 * 1000);
@@ -414,22 +315,20 @@ export default function Stats  ({ route, navigation }) {
       const dayIndex = (checkDate.getDay() + 6) % 7;
       const weekNum = getWeekNumber(checkDate);
       
-      // Only show data from current week
       if (weekNum === currentWeek) {
-        const progressKey = `${DAILY_STATUS_KEY}${dateKey}`;
-        
         try {
-          const progressData = await AsyncStorage.getItem(progressKey);
+          const dailyProgress = await FirestoreDataService.getDailyProgress(userId, dateKey);
+          
           let taken = 0;
-          let total = 0;
           
-          if (progressData) {
-            const progress = JSON.parse(progressData);
-            const statuses = Object.values(progress);
-            taken = statuses.filter(item => item.status === 'taken').length;
-            total = statuses.length;
-          }
+          Object.values(dailyProgress).forEach(medProgress => {
+            if (medProgress.status === 'taken') {
+              taken++;
+            }
+          });
           
+          // ✅ FIXED: Use activeMedicinesCount as total, not Object.keys(dailyProgress).length
+          const total = activeMedicinesCount;
           const percentage = total > 0 ? Math.round((taken / total) * 100) : 0;
           
           weekData.push({
@@ -444,11 +343,10 @@ export default function Stats  ({ route, navigation }) {
             day: days[dayIndex],
             percentage: 0,
             taken: 0,
-            total: 0
+            total: activeMedicinesCount
           });
         }
       } else {
-        // If date is from previous week, show as 0
         weekData.push({
           day: days[dayIndex],
           percentage: 0,
@@ -461,55 +359,64 @@ export default function Stats  ({ route, navigation }) {
     return weekData;
   };
 
-  const getTopPerformingMeds = async (medicineList, userId) => {
+ const getTopPerformingMeds = async (medicineList, userId) => {
     if (!userId) return [];
     
-    const medPerformance = {};
-    const today = new Date();
-    const currentWeek = getWeekNumber(today);
-    const DAILY_STATUS_KEY = getDailyStatusKey(userId);
+    try {
+      const progressData = await FirestoreDataService.getProgressForDateRange(userId, 7);
+      const medPerformance = {};
 
-    for (let i = 0; i < 7; i++) {
-      const checkDate = new Date(today.getTime() - i * 24 * 60 * 60 * 1000);
-      const dateKey = checkDate.toISOString().split('T')[0];
-      const weekNum = getWeekNumber(checkDate);
-      
-      // Only count data from current week
-      if (weekNum === currentWeek) {
-        const progressKey = `${DAILY_STATUS_KEY}${dateKey}`;
-        
-        try {
-          const progressData = await AsyncStorage.getItem(progressKey);
-          if (progressData) {
-            const progress = JSON.parse(progressData);
-            
-            Object.entries(progress).forEach(([medId, data]) => {
-              if (!medPerformance[medId]) {
-                medPerformance[medId] = { taken: 0, total: 0, name: data.medicineName || 'Unknown' };
-              }
-              medPerformance[medId].total += 1;
-              if (data.status === 'taken') {
-                medPerformance[medId].taken += 1;
-              }
-            });
-          }
-        } catch (error) {
-          console.error('Failed to get performance data for', dateKey, error);
+      // ✅ Initialize all active medicines with 0 counts
+      medicineList.forEach(med => {
+        if (med.reminderTimes && med.reminderTimes.length > 0 && med.reminderEnabled !== false) {
+          medPerformance[med.id] = {
+            taken: 0,
+            total: 0,
+            name: med.name || 'Unknown'
+          };
         }
-      }
+      });
+
+      // Count days with actual data
+      let daysWithData = 0;
+      Object.values(progressData).forEach(dayData => {
+        if (Object.keys(dayData).length > 0) {
+          daysWithData++;
+        }
+      });
+
+      // ✅ Set expected total for each medicine (1 dose per day with data)
+      Object.keys(medPerformance).forEach(medId => {
+        medPerformance[medId].total = daysWithData;
+      });
+
+      // Count actual taken doses
+      Object.values(progressData).forEach(dayData => {
+        Object.entries(dayData).forEach(([medId, medProgress]) => {
+          if (medPerformance[medId]) {
+            if (medProgress.status === 'taken') {
+              medPerformance[medId].taken += 1;
+            }
+          }
+        });
+      });
+
+      const topPerforming = Object.values(medPerformance)
+        .map(med => ({
+          name: med.name,
+          percentage: med.total > 0 ? Math.round((med.taken / med.total) * 100) : 0,
+          color: getRandomColor()
+        }))
+        .sort((a, b) => b.percentage - a.percentage)
+        .slice(0, 3);
+
+      return topPerforming;
+    } catch (error) {
+      console.error('Failed to get top performing meds:', error);
+      return [];
     }
-
-    const topPerforming = Object.values(medPerformance)
-      .map(med => ({
-        name: med.name,
-        percentage: med.total > 0 ? Math.round((med.taken / med.total) * 100) : 0,
-        color: getRandomColor()
-      }))
-      .sort((a, b) => b.percentage - a.percentage)
-      .slice(0, 3);
-
-    return topPerforming;
   };
+
 
   const getRandomColor = () => {
     const colors = ['#9D4EDD', '#4CAF50', '#FF9800', '#2196F3', '#F44336', '#00BCD4'];
